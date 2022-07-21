@@ -71,35 +71,35 @@ class JobOutput:
         new_string, byte_count = self._read_new(string, byte_count_offset)
         if byte_count > byte_count_offset:
             dbx_echo(
-                f"[Run Id: {self.run_data['run_id']}] {label} -\n{new_string}",
+                f"[Run Id: {self.run_data['run_id']}] {label} - {new_string}",
             )
         return byte_count
 
     def print_logs(self):
         self._current_byte_count_offset_logs = self._print_new(
             label="Latest cluster logs",
-            string=self.logs,
+            string=f"\n{self.logs}",
             byte_count_offset=self._current_byte_count_offset_logs
         )
 
     def print_notebook_output(self):
         self._current_byte_count_offset_notebook = self._print_new(
             label="Latest notebook output",
-            string=self.notebook_output["result"],
+            string=f"\n{self.notebook_output['result']}",
             byte_count_offset=self._current_byte_count_offset_notebook
         )
 
     def print_error(self):
         self._current_byte_count_offset_error = self._print_new(
             label="Error",
-            string=self.error,
+            string=f"\n{self.error}",
             byte_count_offset=self._current_byte_count_offset_error
         )
 
     def print_error_trace(self):
         self._current_byte_count_offset_traceback = self._print_new(
             label="Error traceback",
-            string=self.error_trace,
+            string=f"\n{self.error_trace}",
             byte_count_offset=self._current_byte_count_offset_traceback
         )
 
@@ -495,7 +495,7 @@ def _wait_run(api_client: ApiClient, run_data: Dict[str, Any], job_output_log_le
     output = JobOutput(api_client, run_data)
     while True:
         # print at exact interval compensated for time taken to process API request
-        time.sleep(min(5 - output._process_s, 5))  # runs API is eventually consistent, it's better to have a short pause for status update
+        time.sleep(min(max(0, 5 - output._process_s), 5))  # runs API is eventually consistent, it's better to have a short pause for status update
 
         output.get()
         output.print_status()
