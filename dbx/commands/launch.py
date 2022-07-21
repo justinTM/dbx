@@ -71,7 +71,7 @@ class JobOutput:
         new_string, byte_count = self._read_new(string, byte_count_offset)
         if byte_count > byte_count_offset:
             dbx_echo(
-                f"[Run Id: {self.run_data['run_id']}] {label} - {new_string}",
+                f"[Run Id: {self.run_data['run_id']}] {label} -\n{new_string}",
             )
         return byte_count
 
