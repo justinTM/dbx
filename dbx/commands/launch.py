@@ -111,6 +111,16 @@ class JobOutput:
             f"state message: {self.run_state.get('state_message', '')}",
             byte_count_offset=0
         )
+    
+    def print_outputs(self, output_log_level):
+        if output_log_level in ["all", "notebook"]:
+            self.print_notebook_output()
+        if output_log_level in ["all", "logs"]:
+            self.print_logs()
+        if output_log_level in ["all", "error"]:
+            self.print_error_trace()
+            self.print_error()
+        
 
 @click.command(
     context_settings=CONTEXT_SETTINGS,
@@ -499,15 +509,10 @@ def _wait_run(api_client: ApiClient, run_data: Dict[str, Any], job_output_log_le
 
         output.get()
         output.print_status()
-        if job_output_log_level in ["all", "notebook"]:
-            output.print_notebook_output()
-        if job_output_log_level in ["all", "logs"]:
-            output.print_logs()
-        if job_output_log_level in ["all", "error"]:
-            output.print_error_trace()
-            output.print_error()
+        output.print_outputs(job_output_log_level)
 
         if output.run_state.get("life_cycle_state") in TERMINAL_RUN_LIFECYCLE_STATES:
+            output.print_outputs(job_output_log_level)
             dbx_echo(f"Finished tracing run with id {run_data['run_id']}")
             return output
 
