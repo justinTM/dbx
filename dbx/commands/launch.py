@@ -1,96 +1,126 @@
-import base64
-import io
-import json
+import tempfile
 import time
+from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from typing import List
+import io
 
 import click
 import mlflow
 import pandas as pd
 from databricks_cli.configure.config import debug_option
-from databricks_cli.dbfs.api import DbfsService
 from databricks_cli.jobs.api import JobsService
 from databricks_cli.sdk.api_client import ApiClient
 from databricks_cli.utils import CONTEXT_SETTINGS
+from mlflow.tracking import MlflowClient
 
 from dbx.api.configure import ConfigurationManager
+from dbx.utils import dbx_echo
 from dbx.utils.common import (
     generate_filter_string,
     prepare_environment,
     parse_multiple,
     get_current_branch_name,
 )
-from dbx.utils import dbx_echo
-from dbx.utils.options import environment_option
 from dbx.utils.job_listing import find_job_by_name
+from dbx.utils.json import JsonUtils
+from dbx.utils.options import environment_option
 
 TERMINAL_RUN_LIFECYCLE_STATES = ["TERMINATED", "SKIPPED", "INTERNAL_ERROR"]
 POSSIBLE_TASK_KEYS = ["notebook_task", "spark_jar_task", "spark_python_task", "spark_submit_task"]
 
 
 class JobOutput:
+    """The class for printing job output (logs, notebook output, errors) while tracing job launch."""
     def __init__(self, api_client, run_data):
         self.api_client = api_client
         self.run_data = run_data
         self._current_byte_count_offset_logs = 0
         self._current_byte_count_offset_notebook = 0
-        self.response = {}
+        self._current_byte_count_offset_error = 0
+        self._current_byte_count_offset_traceback = 0
+        self._response = {}
         self._refresh()
         self._process_s = 0
 
     def get(self):
         process_s_start = time.time()
         jobs_service = JobsService(self.api_client)
-        self.response = jobs_service.get_run(self.run_data["run_id"])
+        self._response = jobs_service.get_run_output(self.run_data["run_id"])
         self._refresh()
         self._process_s = time.time() - process_s_start
 
     def _refresh(self):
-        self.logs = self.response.get("logs", {})
-        self.logs_truncated = self.response.get("logs_truncated", {})
-        self.error = self.response.get("error", {})
-        self.error_trace = self.response.get("error_trace", {})
-        self.metadata = self.response.get("metadata", {})
+        self.logs = self._response.get("logs", "")
+        self.logs_truncated = self._response.get("logs_truncated", False)
+        self.error = self._response.get("error", "")
+        self.error_trace = self._response.get("error_trace", "")
+        self.metadata = self._response.get("metadata", {})
         self.run_state = self.metadata.get("state", {})
+        self.notebook_output = self._response.get("notebook_output", {})
+        self.notebook_output["result"] = self.notebook_output.get("result", "")
+        self.notebook_output["truncated"] = self.notebook_output.get("truncated", False)
 
     def _read_new(self, string, byte_count_offset):
-        byte_count = len(string.encode('utf-8'))
+        byte_count = len(string.encode('utf-16'))
         filelike = io.StringIO(string)
         filelike.seek(byte_count_offset)
         return filelike.read(), byte_count
 
     def _print_new(self, label: str, string: str, byte_count_offset: int):
         new_string, byte_count = self._read_new(string, byte_count_offset)
-        if byte_count > self._current_byte_count_offset_logs:
+        if byte_count > byte_count_offset:
             dbx_echo(
-                f"[Run Id: {self.run_data['run_id']}] {label} - ",
-                new_string
+                f"[Run Id: {self.run_data['run_id']}] {label} - {new_string}",
             )
-        self._current_byte_count_offset_logs = byte_count
+        return byte_count
 
     def print_logs(self):
-        self._print_new(
+        self._current_byte_count_offset_logs = self._print_new(
             label="Latest cluster logs",
-            string=self.logs,
+            string=f"\n{self.logs}",
             byte_count_offset=self._current_byte_count_offset_logs
         )
 
     def print_notebook_output(self):
-        self._print_new(
+        self._current_byte_count_offset_notebook = self._print_new(
             label="Latest notebook output",
-            string=self.notebook_output,
+            string=f"\n{self.notebook_output['result']}",
             byte_count_offset=self._current_byte_count_offset_notebook
+        )
+
+    def print_error(self):
+        self._current_byte_count_offset_error = self._print_new(
+            label="Error",
+            string=f"\n{self.error}",
+            byte_count_offset=self._current_byte_count_offset_error
+        )
+
+    def print_error_trace(self):
+        self._current_byte_count_offset_traceback = self._print_new(
+            label="Error traceback",
+            string=f"\n{self.error_trace}",
+            byte_count_offset=self._current_byte_count_offset_traceback
         )
 
     def print_status(self):
         self._print_new(
             label="Current run status info",
-            string=f"result state: {self.run_state.get('result_state', None)}, "
-            f"lifecycle state: {self.run_state.get('life_cycle_state', None)}, "
+            string=f"result state: {self.run_state.get('result_state')}, "
+            f"lifecycle state: {self.run_state.get('life_cycle_state')}, "
             f"state message: {self.run_state.get('state_message', '')}",
             byte_count_offset=0
         )
+    
+    def print_outputs(self, output_log_level):
+        if output_log_level in ["all", "notebook"]:
+            self.print_notebook_output()
+        if output_log_level in ["all", "logs"]:
+            self.print_logs()
+        if output_log_level in ["all", "error"]:
+            self.print_error_trace()
+            self.print_error()
+        
 
 @click.command(
     context_settings=CONTEXT_SETTINGS,
@@ -164,10 +194,19 @@ class JobOutput:
               If not provided or empty, dbx will try to detect the branch name.""",
 )
 @click.option(
-    "--print-output",
-    is_flag=True,
+    "--job-output-log-level",
+    type=click.Choice(["all", "notebook", "logs", "error", "none"]),
+    default="none",
     help="""In addition to job status, print notebook output and/or cluster logs if available from job.
-              For launched python jobs, this is the result of calls to the `print()` function.""",
+
+            For launched python jobs (spark_python_task), cluster logs is the result of calls to the `print()` function.
+
+            Options behaviour:
+            * :code:`all` will print notebook output, cluster logs, and errors
+            * :code:`notebook` will print notebook output and errors
+            * :code:`logs` will print cluster logs and errors
+            * :code:`error` will output job run errors only
+            * :code:`none` will not output any job run logs""",
 )
 @environment_option
 @debug_option
@@ -182,7 +221,7 @@ def launch(
     parameters: List[str],
     parameters_raw: Optional[str],
     branch_name: Optional[str],
-    print_output: bool,
+    job_output_log_level: Optional[str],
 ):
     dbx_echo(f"Launching job {job} on environment {environment}")
 
@@ -198,22 +237,30 @@ def launch(
         override_parameters = parse_multiple(parameters)
         prepared_parameters = sum([[k, v] for k, v in override_parameters.items()], [])
 
-    filter_string = generate_filter_string(environment)
+    filter_string = generate_filter_string(environment, branch_name)
 
     run_info = _find_deployment_run(filter_string, additional_tags, as_run_submit, environment)
 
     deployment_run_id = run_info["run_id"]
 
-    with mlflow.start_run(run_id=deployment_run_id) as deployment_run:
+    with mlflow.start_run(run_id=deployment_run_id):
 
         with mlflow.start_run(nested=True):
-            artifact_base_uri = deployment_run.info.artifact_uri
 
             if not as_run_submit:
-                run_launcher = RunNowLauncher(job, api_client, artifact_base_uri, existing_runs, prepared_parameters, print_output)
+                run_launcher = RunNowLauncher(
+                    job=job, api_client=api_client, existing_runs=existing_runs,
+                    prepared_parameters=prepared_parameters,
+                    job_output_log_level=job_output_log_level
+                )
             else:
                 run_launcher = RunSubmitLauncher(
-                    job, api_client, artifact_base_uri, existing_runs, prepared_parameters, environment
+                    job=job,
+                    api_client=api_client,
+                    existing_runs=existing_runs,
+                    prepared_parameters=prepared_parameters,
+                    deployment_run_id=deployment_run_id,
+                    environment=environment,
                 )
 
             run_data, job_id = run_launcher.launch()
@@ -226,14 +273,14 @@ def launch(
                 if kill_on_sigterm:
                     dbx_echo("Click Ctrl+C to stop the run")
                     try:
-                        dbx_status = _trace_run(api_client, run_data, print_output)
+                        dbx_status = _trace_run(api_client, run_data, job_output_log_level)
                     except KeyboardInterrupt:
                         dbx_status = "CANCELLED"
                         dbx_echo("Cancelling the run gracefully")
                         _cancel_run(api_client, run_data)
                         dbx_echo("Run cancelled successfully")
                 else:
-                    dbx_status = _trace_run(api_client, run_data, print_output)
+                    dbx_status = _trace_run(api_client, run_data, job_output_log_level)
 
                 if dbx_status == "ERROR":
                     raise Exception("Tracked run failed during execution. Please check Databricks UI for run logs")
@@ -263,7 +310,7 @@ def launch(
 def _find_deployment_run(
     filter_string: str, tags: Dict[str, str], as_run_submit: bool, environment: str
 ) -> Dict[str, Any]:
-    runs = mlflow.search_runs(filter_string=filter_string, order_by=["start_time DESC"])
+    runs = mlflow.search_runs(filter_string=filter_string)
 
     filter_conditions = []
 
@@ -333,14 +380,14 @@ class RunSubmitLauncher:
         self,
         job: str,
         api_client: ApiClient,
-        artifact_base_uri: str,
+        deployment_run_id: str,
         existing_runs: str,
         prepared_parameters: Any,
         environment: str,
     ):
+        self.run_id = deployment_run_id
         self.job = job
         self.api_client = api_client
-        self.artifact_base_uri = artifact_base_uri
         self.existing_runs = existing_runs
         self.prepared_parameters = prepared_parameters
         self.environment = environment
@@ -348,9 +395,7 @@ class RunSubmitLauncher:
     def launch(self) -> Tuple[Dict[Any, Any], Optional[str]]:
         dbx_echo("Launching job via run submit API")
 
-        env_spec = _load_dbx_file(self.api_client, self.artifact_base_uri, "deployment-result.json").get(
-            self.environment
-        )
+        env_spec = _load_dbx_file(self.run_id, "deployment-result.json").get(self.environment)
 
         if not env_spec:
             raise Exception(f"No job definitions found for environment {self.environment}")
@@ -373,15 +418,12 @@ class RunSubmitLauncher:
 
 
 class RunNowLauncher:
-    def __init__(
-        self, job: str, api_client: ApiClient, artifact_base_uri: str, existing_runs: str, prepared_parameters: Any, print_output: bool
-    ):
+    def __init__(self, job: str, api_client: ApiClient, existing_runs: str, prepared_parameters: Any, job_output_log_level: Any):
         self.job = job
         self.api_client = api_client
-        self.artifact_base_uri = artifact_base_uri
         self.existing_runs = existing_runs
         self.prepared_parameters = prepared_parameters
-        self.print_output = print_output
+        self.job_output_log_level = job_output_log_level
 
     def launch(self) -> Tuple[Dict[Any, Any], Optional[str]]:
         dbx_echo("Launching job via run now API")
@@ -401,7 +443,7 @@ class RunNowLauncher:
 
             if self.existing_runs == "wait":
                 dbx_echo(f'Waiting for job run with id {run["run_id"]} to be finished')
-                _wait_run(self.api_client, run, self.print_output)
+                _wait_run(self.api_client, run, self.job_output_log_level)
 
             if self.existing_runs == "cancel":
                 dbx_echo(f'Cancelling run with id {run["run_id"]}')
@@ -450,36 +492,34 @@ def _cancel_run(api_client: ApiClient, run_data: Dict[str, Any]):
     _wait_run(api_client, run_data)
 
 
-def _load_dbx_file(api_client: ApiClient, artifact_base_uri: str, name: str) -> Dict[Any, Any]:
-    dbfs_service = DbfsService(api_client)
-    dbx_deployments = f"{artifact_base_uri}/.dbx/{name}"
-    raw_config_payload = dbfs_service.read(dbx_deployments)["data"]
-    payload = base64.b64decode(raw_config_payload).decode("utf-8")
-    deployments = json.loads(payload)
-    return deployments
+def _load_dbx_file(run_id: str, file_name: str) -> Dict[Any, Any]:
+    client = MlflowClient()
+    with tempfile.TemporaryDirectory() as tmp:
+        dbx_file_path = f".dbx/{file_name}"
+        client.download_artifacts(run_id, dbx_file_path, tmp)
+        return JsonUtils.read(Path(tmp) / dbx_file_path)
 
 
-def _wait_run(api_client: ApiClient, run_data: Dict[str, Any], print_output: bool) -> Dict[str, Any]:
+def _wait_run(api_client: ApiClient, run_data: Dict[str, Any], job_output_log_level: str) -> JobOutput:
     dbx_echo(f"Tracing run with id {run_data['run_id']}")
     output = JobOutput(api_client, run_data)
     while True:
         # print at exact interval compensated for time taken to process API request
-        time.sleep(min(5 - output._process_s), 0)  # runs API is eventually consistent, it's better to have a short pause for status update
+        time.sleep(min(max(0, 5 - output._process_s), 5))  # runs API is eventually consistent, it's better to have a short pause for status update
 
         output.get()
         output.print_status()
-        if print_output:
-            output.print_logs()
-            output.print_notebook_output()
+        output.print_outputs(job_output_log_level)
 
-        if output.life_cycle_state in TERMINAL_RUN_LIFECYCLE_STATES:
+        if output.run_state.get("life_cycle_state") in TERMINAL_RUN_LIFECYCLE_STATES:
+            output.print_outputs(job_output_log_level)
             dbx_echo(f"Finished tracing run with id {run_data['run_id']}")
             return output
 
 
-def _trace_run(api_client: ApiClient, run_data: Dict[str, Any], print_output: bool) -> str:
-    final_status = _wait_run(api_client, run_data, print_output)
-    result_state = final_status["metadata"]["state"].get("result_state", None)
+def _trace_run(api_client: ApiClient, run_data: Dict[str, Any], job_output_log_level: bool) -> str:
+    job_output = _wait_run(api_client, run_data, job_output_log_level)
+    result_state = job_output.metadata.get("state").get("result_state")
     if result_state == "SUCCESS":
         dbx_echo("Job run finished successfully")
         return "SUCCESS"
