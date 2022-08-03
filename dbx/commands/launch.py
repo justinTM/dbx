@@ -62,7 +62,7 @@ class JobOutput:
         self.notebook_output["truncated"] = self.notebook_output.get("truncated", False)
 
     def _read_new(self, string, byte_count_offset):
-        byte_count = len(string.encode('utf-8'))
+        byte_count = len(string.encode('utf-16'))
         filelike = io.StringIO(string)
         filelike.seek(byte_count_offset)
         return filelike.read(), byte_count
